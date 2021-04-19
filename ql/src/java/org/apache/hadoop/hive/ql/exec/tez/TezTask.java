@@ -353,49 +353,37 @@ public class TezTask extends Task<TezWork> {
     for (BaseWork w : work.getAllWork()) {
       JobConf jobConf = workToConf.get(w);
       Vertex vertex = workToVertex.get(w);
-      String jobIdPrefix = dagClient.getDagIdentifierString().split("_")[1];
       // we should only consider jobs where an output committer is defined
       if (!vertex.getDataSinks().isEmpty() && jobConf != null && "org.apache.iceberg.mr.hive.HiveIcebergOutputCommitter"
           .equals(jobConf.getOutputCommitter().getClass().getName())) {
-        String tableName = jobConf.get("name");
-        String tableLocationRoot = jobConf.get("location");
-        if (tableName != null && tableLocationRoot != null) {
-          VertexStatus status = dagClient.getVertexStatus(vertex.getName(), EnumSet.of(StatusGetOpts.GET_COUNTERS));
-          Path path = new Path(tableLocationRoot + "/temp");
-          LOG.debug("Table temp directory path is: " + path);
-          // list the directories inside the temp directory
-          FileStatus[] children = path.getFileSystem(jobConf).listStatus(path);
-          LOG.debug("Listing the table temp directory yielded these files: " + Arrays.toString(children));
-          for (FileStatus child : children) {
-            // pick only directories that contain the correct jobID prefix
-            if (child.isDirectory() && child.getPath().getName().contains(jobIdPrefix)) {
-              // folder name pattern is queryID-jobID, we're removing the queryID part to get the jobID
-              String jobIdStr = child.getPath().getName().substring(jobConf.get("hive.query.id").length() + 1);
-              // get all target tables this vertex wrote to
-              List<String> tables = new ArrayList<>();
-              for (Map.Entry<String, String> entry : jobConf) {
-                if (entry.getKey().startsWith("iceberg.mr.serialized.table.")) {
-                  tables.add(entry.getKey().substring("iceberg.mr.serialized.table.".length()));
-                }
-              }
-              // save information for each target table (jobID, task num, query state)
-              for (String table : tables) {
-                sessionConf.set(HIVE_TEZ_COMMIT_JOB_ID + "." + table, jobIdStr);
-                sessionConf.setInt(HIVE_TEZ_COMMIT_TASK_COUNT + "." + table,
-                    status.getProgress().getSucceededTaskCount());
-                sessionConf.setBoolean(jobConf.get("hive.query.id") + "." + table + ".result", success);
-              }
-            }
+        // construct the parsable job id
+        VertexStatus status = dagClient.getVertexStatus(vertex.getName(), EnumSet.of(StatusGetOpts.GET_COUNTERS));
+        String[] jobIdParts = status.getId().split("_");
+        // status.getId() returns something like: vertex_1617722404520_0001_1_00
+        // this should be transformed to a parsable JobID: job_16177224045200_0001
+        int vertexId = Integer.parseInt(jobIdParts[jobIdParts.length - 1]);
+        String jobId = String.format("job_%s%d_%s", jobIdParts[1], vertexId, jobIdParts[2]);
+
+        // get all target tables this vertex wrote to
+        List<String> tables = new ArrayList<>();
+        for (Map.Entry<String, String> entry : jobConf) {
+          if (entry.getKey().startsWith("iceberg.mr.serialized.table.")) {
+            tables.add(entry.getKey().substring("iceberg.mr.serialized.table.".length()));
           }
-          // save iceberg mr props as they can be needed during job commit (e.g. serialized table)
-          jobConf.forEach(e -> {
-            if (e.getKey().startsWith("iceberg.mr.")) {
-              sessionConf.set(e.getKey(), e.getValue());
-            }
-          });
-        } else {
-          LOG.warn("Table location or table name not found in config for base work: " + w.getName());
         }
+        // save information for each target table (jobID, task num, query state)
+        for (String table : tables) {
+          sessionConf.set(HIVE_TEZ_COMMIT_JOB_ID + "." + table, jobId);
+          sessionConf.setInt(HIVE_TEZ_COMMIT_TASK_COUNT + "." + table,
+              status.getProgress().getSucceededTaskCount());
+          sessionConf.setBoolean(jobConf.get("hive.query.id") + "." + table + ".result", success);
+        }
+        // save iceberg mr props as they can be needed during job commit (e.g. serialized table)
+        jobConf.forEach(e -> {
+          if (e.getKey().startsWith("iceberg.mr.")) {
+            sessionConf.set(e.getKey(), e.getValue());
+          }
+        });
       }
     }
   }
